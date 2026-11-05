@@ -1,307 +1,374 @@
 import os
 import re
-import json
 import random
 import threading
-
+import logging
+import requests
 import telebot
+
 from flask import Flask
+from telebot import types
 
-TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "").lstrip("@").lower()
+logging.basicConfig(level=logging.INFO)
 
-if not TOKEN:
-    raise RuntimeError("BOT_TOKEN غير موجود")
+# إعدادات البوت
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@Aboemq").lstrip("@").lower()
 
-bot = telebot.TeleBot(TOKEN)
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+
+if not BOT_TOKEN or not SUPABASE_URL or not SUPABASE_KEY:
+    raise RuntimeError("Missing required environment variables")
+
+bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 
-BUTTON_RANDOM = "امم مافي شي 🍌💦🍌"
-BUTTON_SETTINGS = "ايش حاب اليوم 👅👄"
+# تخزين نوع الوسائط مؤقتاً أثناء اختيار العدد
+pending_types = {}
 
-MEDIA_FILE = "media.json"
-PREFS_FILE = "preferences.json"
-
-lock = threading.Lock()
-
-
-def load_json(filename, default):
-    try:
-        with open(filename, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
+# الاتصال بقاعدة البيانات
+def db_headers():
+    return {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json"
+    }
 
 
-media = load_json(MEDIA_FILE, {"photo": [], "video": []})
-preferences = load_json(PREFS_FILE, {})
+def db_get(table, params=None):
+    response = requests.get(
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        headers=db_headers(),
+        params=params or {},
+        timeout=20
+    )
+    response.raise_for_status()
+    return response.json()
 
 
-def save_json(filename, data):
-    with lock:
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+def db_upsert(table, data, conflict):
+    response = requests.post(
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        params={"on_conflict": conflict},
+        headers={
+            **db_headers(),
+            "Prefer": "resolution=merge-duplicates,return=minimal"
+        },
+        json=data,
+        timeout=20
+    )
+    response.raise_for_status()
 
 
+# استخراج رابط MEGA من وصف الصورة
 def get_mega_link(caption):
     if not caption:
         return ""
 
-    match = re.search(r"https?://(?:www\.)?mega\.nz/\S+", caption)
+    match = re.search(
+        r"https?://(?:www\.)?mega\.(?:nz|co\.nz)/\S+",
+        caption
+    )
 
     if match:
-        return match.group(0).rstrip(".,)]}")
+        return match.group(0).rstrip(".,،)")
 
     return ""
 
 
-def get_keyboard():
-    keyboard = telebot.types.ReplyKeyboardMarkup(
-        resize_keyboard=True,
-        is_persistent=True
+# حفظ صورة أو فيديو في Supabase
+def save_media(media_type, file_id, mega_url=""):
+    db_upsert(
+        "media",
+        {
+            "media_type": media_type,
+            "file_id": file_id,
+            "mega_url": mega_url
+        },
+        "file_id"
     )
-    keyboard.row(
-        telebot.types.KeyboardButton(BUTTON_RANDOM)
-    )
-    keyboard.row(
-        telebot.types.KeyboardButton(BUTTON_SETTINGS)
-    )
-    return keyboard
 
 
 # استقبال الصور والفيديوهات من القناة
 @bot.channel_post_handler(content_types=["photo", "video"])
-def save_media(message):
+def receive_media(message):
+    username = (message.chat.username or "").lower()
 
-    if CHANNEL_USERNAME:
-        channel_name = (message.chat.username or "").lower()
-        if channel_name != CHANNEL_USERNAME:
-            return
+    if username != CHANNEL_USERNAME:
+        return
 
-    if message.content_type == "photo":
-        item = {
-            "file_id": message.photo[-1].file_id,
-            "mega_url": get_mega_link(message.caption)
-        }
-        category = "photo"
+    try:
+        if message.photo:
+            file_id = message.photo[-1].file_id
+            mega_url = get_mega_link(message.caption)
 
-    else:
-        item = {
-            "file_id": message.video.file_id
-        }
-        category = "video"
+            save_media("photo", file_id, mega_url)
 
-    with lock:
-        if not any(
-            x["file_id"] == item["file_id"]
-            for x in media[category]
-        ):
-            media[category].append(item)
-            updated = True
-        else:
-            updated = False
+        elif message.video:
+            file_id = message.video.file_id
 
-    if updated:
-        save_json(MEDIA_FILE, media)
+            save_media("video", file_id, "")
+
+        logging.info("Media saved successfully")
+
+    except Exception:
+        logging.exception("Could not save media")
 
 
-# بداية البوت
+# لوحة الأزرار الرئيسية
+def main_keyboard():
+    keyboard = types.ReplyKeyboardMarkup(
+        resize_keyboard=True
+    )
+
+    keyboard.row("امم مافي شي 🍌💦🍌")
+    keyboard.row("ايش حاب اليوم 👅👄")
+
+    return keyboard
+
+
 @bot.message_handler(commands=["start"])
 def start(message):
     bot.send_message(
         message.chat.id,
-        "أهلًا بك 🎲\nاختر الزر الذي تريده:",
-        reply_markup=get_keyboard()
+        "أهلاً بك! اختر ماذا تريد:",
+        reply_markup=main_keyboard()
     )
 
 
-# فتح إعدادات العشوائية
-@bot.message_handler(func=lambda m: m.text == BUTTON_SETTINGS)
-def settings(message):
+# قراءة إعدادات المستخدم
+def get_preferences(user_id):
+    rows = db_get(
+        "user_preferences",
+        {
+            "user_id": f"eq.{user_id}",
+            "select": "media_type,item_count"
+        }
+    )
 
-    keyboard = telebot.types.InlineKeyboardMarkup(row_width=1)
+    if rows:
+        return rows[0]
+
+    return {
+        "media_type": "both",
+        "item_count": 5
+    }
+
+
+# حفظ إعدادات المستخدم
+def save_preferences(user_id, media_type, item_count):
+    db_upsert(
+        "user_preferences",
+        {
+            "user_id": user_id,
+            "media_type": media_type,
+            "item_count": item_count
+        },
+        "user_id"
+    )
+
+
+# زر الإعدادات
+@bot.message_handler(func=lambda m: m.text == "ايش حاب اليوم 👅👄")
+def settings(message):
+    keyboard = types.InlineKeyboardMarkup()
 
     keyboard.add(
-        telebot.types.InlineKeyboardButton(
-            "📸 صور فقط", callback_data="type_photo"
-        ),
-        telebot.types.InlineKeyboardButton(
-            "🎬 فيديوهات فقط", callback_data="type_video"
-        ),
-        telebot.types.InlineKeyboardButton(
-            "🎲 صور وفيديوهات مع بعض", callback_data="type_both"
+        types.InlineKeyboardButton(
+            "صور فقط 📷",
+            callback_data="type_photo"
+        )
+    )
+
+    keyboard.add(
+        types.InlineKeyboardButton(
+            "فيديو فقط 🎬",
+            callback_data="type_video"
+        )
+    )
+
+    keyboard.add(
+        types.InlineKeyboardButton(
+            "صور وفيديو 🎲",
+            callback_data="type_both"
         )
     )
 
     bot.send_message(
         message.chat.id,
-        "ايش تحب يجيك؟ اختر نوع العشوائية:",
+        "اختر نوع الوسائط:",
         reply_markup=keyboard
     )
 
 
-# اختيار النوع
+# اختيار نوع الوسائط
 @bot.callback_query_handler(func=lambda call: call.data.startswith("type_"))
 def choose_type(call):
+    media_type = call.data.replace("type_", "")
 
-    user_id = str(call.from_user.id)
-    selected = call.data.replace("type_", "")
-
-    preferences[user_id] = {
-        "type": selected,
-        "count": preferences.get(user_id, {}).get("count", 5)
-    }
-
-    save_json(PREFS_FILE, preferences)
+    pending_types[call.from_user.id] = media_type
 
     bot.answer_callback_query(call.id)
 
-    bot.send_message(
+    sent = bot.send_message(
         call.message.chat.id,
-        "كم ملف عشوائي تبي يجيك كل مرة؟\n"
-        "اكتب الرقم الذي تريده، مثل 5 أو 10 أو 20."
+        "كم صورة أو فيديو تريد؟ اكتب رقماً من 1 إلى 50."
     )
 
     bot.register_next_step_handler(
-        call.message,
-        receive_count,
-        user_id
+        sent,
+        save_count,
+        call.from_user.id
     )
 
 
-# استقبال العدد
-def receive_count(message, user_id):
-
-    if not message.text or not message.text.isdigit():
+# حفظ العدد والإعدادات
+def save_count(message, user_id):
+    if message.text == "/cancel":
         bot.send_message(
             message.chat.id,
-            "اكتب رقمًا صحيحًا من 1 إلى 50."
+            "تم إلغاء الإعدادات.",
+            reply_markup=main_keyboard()
         )
+        pending_types.pop(user_id, None)
+        return
+
+    try:
+        count = int(message.text)
+
+        if not 1 <= count <= 50:
+            raise ValueError
+
+        media_type = pending_types.pop(user_id)
+
+        save_preferences(user_id, media_type, count)
+
+        bot.send_message(
+            message.chat.id,
+            f"تم حفظ إعداداتك! ✅\n"
+            f"النوع: {media_type}\n"
+            f"العدد: {count}",
+            reply_markup=main_keyboard()
+        )
+
+    except ValueError:
+        sent = bot.send_message(
+            message.chat.id,
+            "اكتب رقماً صحيحاً من 1 إلى 50."
+        )
+
         bot.register_next_step_handler(
-            message,
-            receive_count,
+            sent,
+            save_count,
             user_id
         )
-        return
 
-    count = int(message.text)
-
-    if count < 1 or count > 50:
+    except Exception:
+        logging.exception("Saving preferences failed")
         bot.send_message(
             message.chat.id,
-            "اختر عددًا من 1 إلى 50."
-        )
-        bot.register_next_step_handler(
-            message,
-            receive_count,
-            user_id
-        )
-        return
-
-    if user_id not in preferences:
-        preferences[user_id] = {"type": "both", "count": count}
-    else:
-        preferences[user_id]["count"] = count
-
-    save_json(PREFS_FILE, preferences)
-
-    bot.send_message(
-        message.chat.id,
-        f"✅ تم حفظ إعداداتك!\n"
-        f"العدد: {count}\n"
-        f"النوع: {preferences[user_id]['type']}\n\n"
-        f"اضغط زر «{BUTTON_RANDOM}» وقت ما تحب.",
-        reply_markup=get_keyboard()
-    )
-
-
-# إرسال الوسائط حسب إعدادات المستخدم
-def send_random(message):
-
-    user_id = str(message.from_user.id)
-
-    if user_id not in preferences:
-        bot.send_message(
-            message.chat.id,
-            f"حدد إعداداتك أولًا من زر «{BUTTON_SETTINGS}».",
-            reply_markup=get_keyboard()
-        )
-        return
-
-    settings = preferences[user_id]
-    selected_type = settings["type"]
-    count = settings["count"]
-
-    with lock:
-        photos = media["photo"].copy()
-        videos = media["video"].copy()
-
-    if selected_type == "photo":
-        pool = [("photo", x) for x in photos]
-
-    elif selected_type == "video":
-        pool = [("video", x) for x in videos]
-
-    else:
-        pool = (
-            [("photo", x) for x in photos]
-            + [("video", x) for x in videos]
+            "حدث خطأ أثناء حفظ الإعدادات. حاول مرة أخرى."
         )
 
-    if not pool:
-        bot.send_message(
-            message.chat.id,
-            "ما فيه ملفات من النوع الذي اخترته حتى الآن."
+
+# إرسال الوسائط العشوائية
+@bot.message_handler(func=lambda m: m.text == "امم مافي شي 🍌💦🍌")
+def send_random_media(message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    try:
+        preferences = get_preferences(user_id)
+
+        media_type = preferences["media_type"]
+        count = preferences["item_count"]
+
+        media = db_get(
+            "media",
+            {"select": "media_type,file_id,mega_url"}
         )
-        return
 
-    # اختيار عشوائي، مع السماح بالتكرار إذا كان العدد أكبر من المتوفر
-    if count <= len(pool):
-        chosen = random.sample(pool, count)
-    else:
-        chosen = random.choices(pool, k=count)
+        if media_type != "both":
+            media = [
+                item for item in media
+                if item["media_type"] == media_type
+            ]
 
-    for kind, item in chosen:
-        try:
-            if kind == "photo":
-                caption = item.get("mega_url", "")
+        if not media:
+            bot.send_message(
+                chat_id,
+                "ما فيه وسائط من النوع الذي اخترته حالياً."
+            )
+            return
+
+        selected = random.sample(
+            media,
+            min(count, len(media))
+        )
+
+        if len(selected) < count:
+            bot.send_message(
+                chat_id,
+                f"المتوفر حالياً {len(selected)} فقط."
+            )
+
+        for item in selected:
+            if item["media_type"] == "photo":
                 bot.send_photo(
-                    message.chat.id,
+                    chat_id,
                     item["file_id"],
-                    caption=caption if caption else None
+                    caption=item.get("mega_url") or None
                 )
 
-            else:
+            elif item["media_type"] == "video":
                 bot.send_video(
-                    message.chat.id,
+                    chat_id,
                     item["file_id"]
                 )
 
-        except Exception as e:
-            print("Send error:", e)
+    except Exception:
+        logging.exception("Sending random media failed")
+        bot.send_message(
+            chat_id,
+            "حدث خطأ أثناء جلب الوسائط. حاول مرة أخرى."
+        )
 
 
-# زر العشوائية
-@bot.message_handler(func=lambda m: m.text == BUTTON_RANDOM)
-def random_button(message):
-    send_random(message)
-
-
-# عدد الوسائط المحفوظة
+# معرفة عدد الوسائط المحفوظة
 @bot.message_handler(commands=["count"])
-def count_command(message):
+def count_media(message):
+    try:
+        media = db_get(
+            "media",
+            {"select": "media_type"}
+        )
 
-    with lock:
-        photo_count = len(media["photo"])
-        video_count = len(media["video"])
+        photos = sum(
+            1 for item in media
+            if item["media_type"] == "photo"
+        )
 
-    bot.send_message(
-        message.chat.id,
-        f"📸 الصور: {photo_count}\n"
-        f"🎬 الفيديوهات: {video_count}"
-    )
+        videos = sum(
+            1 for item in media
+            if item["media_type"] == "video"
+        )
+
+        bot.send_message(
+            message.chat.id,
+            f"📷 عدد الصور: {photos}\n"
+            f"🎬 عدد الفيديوهات: {videos}"
+        )
+
+    except Exception:
+        logging.exception("Counting media failed")
+        bot.send_message(
+            message.chat.id,
+            "تعذر قراءة عدد الوسائط."
+        )
 
 
+# صفحة Render
 @app.route("/")
 def home():
     return "Bot is running!"
@@ -310,17 +377,18 @@ def home():
 def run_bot():
     bot.infinity_polling(
         skip_pending=True,
-        timeout=20,
-        long_polling_timeout=20
+        timeout=30,
+        long_polling_timeout=30
     )
 
 
-threading.Thread(
-    target=run_bot,
-    daemon=True
-).start()
-
-
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    threading.Thread(
+        target=run_bot,
+        daemon=True
+    ).start()
+
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 10000))
+    )
