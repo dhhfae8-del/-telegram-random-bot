@@ -18,8 +18,21 @@ media = []
 def home():
     return "Bot is running!"
 
-@bot.channel_post_handler(
-    content_types=["photo", "video"]
+@bot.channel_post_handler(content_types=["photo", "video"])
+def save_media(message):
+    username = message.chat.username or ""
+
+    if CHANNEL and username.lower() != CHANNEL:
+        return
+
+    if message.photo:
+        file_id = message.photo[-1].file_id
+        media.append(("photo", file_id))
+
+    elif message.video:
+        media.append(("video", message.video.file_id))
+
+    print("تم استقبال صورة أو فيديو من القناة!")
 )
 def save_media(message):
     username = message.chat.username or ""
