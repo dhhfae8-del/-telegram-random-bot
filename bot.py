@@ -33,7 +33,7 @@ def save_media(message):
         media.append(("video", message.video.file_id))
 
     print("تم استقبال صورة أو فيديو من القناة!")
-)
+
 def save_media(message):
     username = message.chat.username or ""
 
