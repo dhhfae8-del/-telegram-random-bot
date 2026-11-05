@@ -1,5 +1,4 @@
-import os
-import random
+random
 import threading
 import telebot
 from flask import Flask
