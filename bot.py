@@ -31,7 +31,6 @@ pending_types = {}
 def db_headers():
     return {
         "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json"
     }
 
